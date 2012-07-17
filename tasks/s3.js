@@ -27,6 +27,7 @@ module.exports = function (grunt) {
 
   // Npm.
   const knox = require('knox');
+	const iniparser = require('iniparser');
   const mime = require('mime');
   const async = require('async');
   const _ = require('underscore');
@@ -75,7 +76,9 @@ module.exports = function (grunt) {
    * @returns {Object} The s3 configuration.
    */
   function getConfig () {
-    var config = grunt.config('s3') || {};
+    var dfd = _.Deferred();
+
+    var config = grunt.config.process('s3') || {};
 
     // Look for and process grunt template stings
     var keys = ['key', 'secret', 'bucket'];
@@ -85,10 +88,34 @@ module.exports = function (grunt) {
       }
     });
 
-    return _.defaults(config, {
+    config = _.defaults(config, {
       key : process.env.AWS_ACCESS_KEY_ID,
-      secret : process.env.AWS_SECRET_ACCESS_KEY
+      secret : process.env.AWS_SECRET_ACCESS_KEY,
+      upload: [],
+      download: [],
+      del: [],
+      copy: []
     });
+
+    if(config.key && config.secret) {
+      dfd.resolve(config);
+    } else {
+      // Try to read ~/.s3cfg
+      iniparser.parse(path.join(process.env['HOME'], '.s3cfg'), function(err, iniconfig) {
+        iniconfig = iniconfig['default'];
+
+        if(iniconfig['access_key']) config['key'] = iniconfig['access_key'];
+        if(iniconfig['secret_key']) config['secret'] = iniconfig['secret_key'];
+
+        if(config['key'] && config['secret']) {
+          dfd.resolve(config);
+        } else {
+          dfd.reject();
+        }
+      });
+    }
+
+    return dfd;
   }
 
   /**
@@ -98,64 +125,101 @@ module.exports = function (grunt) {
    */
   grunt.registerTask('s3', 'Publishes files to s3.', function () {
     var done = this.async();
-    var config = _.defaults(getConfig(), {
-      upload: [],
-      download: [],
-      del: [],
-      copy: []
-    });
 
-    var transfers = [];
+    getConfig()
+      .then(function(config) {
 
-    config.upload.forEach(function(upload) {
-      // Expand list of files to upload.
-      var files = grunt.file.expandFiles(upload.src);
+        var transfers = [];
 
-      files.forEach(function(file) {
-        // If there is only 1 file and it matches the original file wildcard,
-        // we know this is a single file transfer. Otherwise, we need to build
-        // the destination.
-        var dest = (files.length === 1 && file === upload.src) ?
-          upload.dest :
-          path.join(upload.dest, path.basename(file));
+        config.upload.forEach(function(upload) {
 
-        transfers.push(grunt.helper('s3.put', file, dest, upload));
+          _.defaults(upload, _.pick(config, [ 'endpoint', 'port', 'key', 'secret', 'access', 'bucket' ]));
+
+          var processFile = function(file, err, stat) {
+            var files = [];
+
+            if(stat.isDirectory()) {
+              // .recurse() is synchronous
+              grunt.file.recurse(file, function(abspath, rootdir, subdir, filename) {
+                var dest = [ upload.dest, subdir ?  subdir : path.basename(rootdir, '/') ];
+
+                files.push({
+                  src: path.join(rootdir, subdir, filename),
+                  dest: path.join.apply(null, dest)
+                });
+              });
+            } else {
+              files = _.map(grunt.file.expandFiles(file), function(file) {
+                return {
+                  src: file, dest: upload.dest
+                }
+              })
+            }
+
+            files.forEach(function(file) {
+              // If there is only 1 file and it matches the original file wildcard,
+              // we know this is a single file transfer. Otherwise, we need to build
+              // the destination.
+              var dest = (files.length === 1 && file.src === upload.src) ?
+                file.dest :
+                path.join(file.dest, path.basename(file.src));
+
+              transfers.push(grunt.helper('s3.put', file.src, dest, upload));
+            });
+          };
+
+          var files = grunt.file.expand(upload.src);
+
+          if(!files.length) files = [ upload.src ];
+
+          for(var i = 0; i < files.length; i++) {
+            var stat = fs.statSync(files[i]);
+            processFile(files[i], null, stat);
+          }
+
+        });
+
+        config.download.forEach(function(download) {
+          _.defaults(download, _.pick(config, [ 'endpoint', 'port', 'key', 'secret', 'access', 'bucket' ]));
+
+          transfers.push(grunt.helper('s3.pull', download.src, download.dest, download));
+        });
+
+        config.del.forEach(function(del) {
+          _.defaults(del, _.pick(config, [ 'endpoint', 'port', 'key', 'secret', 'access', 'bucket' ]));
+
+          transfers.push(grunt.helper('s3.delete', del.src, del));
+        });
+
+        config.copy.forEach(function(copy) {
+          _.defaults(copy, _.pick(config, [ 'endpoint', 'port', 'key', 'secret', 'access', 'bucket' ]));
+
+          transfers.push(grunt.helper('s3.copy', copy.src, copy.dest, copy));
+        });
+
+        var total = transfers.length;
+        var errors = 0;
+
+        // Keep a running total of errors/completions as the transfers complete.
+        transfers.forEach(function(transfer) {
+          transfer.done(function(msg) {
+            log.ok(msg);
+          });
+
+          transfer.fail(function(msg) {
+            log.error(msg);
+            ++errors;
+          });
+
+          transfer.always(function() {
+            // If this was the last transfer to complete, we're all done.
+            if (--total === 0) {
+              done(!errors);
+            }
+          });
+        });
+
       });
-    });
-
-    config.download.forEach(function(download) {
-      transfers.push(grunt.helper('s3.pull', download.src, download.dest, download));
-    });
-
-    config.del.forEach(function(del) {
-      transfers.push(grunt.helper('s3.delete', del.src, del));
-    });
-
-    config.copy.forEach(function(copy) {
-      transfers.push(grunt.helper('s3.copy', copy.src, copy.dest, copy));
-    });
-
-    var total = transfers.length;
-    var errors = 0;
-
-    // Keep a running total of errors/completions as the transfers complete.
-    transfers.forEach(function(transfer) {
-      transfer.done(function(msg) {
-        log.ok(msg);
-      });
-
-      transfer.fail(function(msg) {
-        log.error(msg);
-        ++errors;
-      });
-
-      transfer.always(function() {
-        // If this was the last transfer to complete, we're all done.
-        if (--total === 0) {
-          done(!errors);
-        }
-      });
-    });
   });
 
   /**
@@ -178,7 +242,7 @@ module.exports = function (grunt) {
       return dfd.reject(makeError(MSG_ERR_NOT_FOUND, src));
     }
 
-    var config = _.defaults(options || {}, getConfig());
+    // var config = _.defaults(options || {}, getConfig());
     var headers = options.headers || {};
 
     if (options.access) {
@@ -186,7 +250,7 @@ module.exports = function (grunt) {
     }
 
     // Pick out the configuration options we need for the client.
-    var client = knox.createClient(_(config).pick([
+    var client = knox.createClient(_(options).pick([
       'endpoint', 'port', 'key', 'secret', 'access', 'bucket'
     ]));
 
@@ -295,13 +359,12 @@ module.exports = function (grunt) {
    */
   grunt.registerHelper('s3.pull', function (src, dest, options) {
     var dfd = new _.Deferred();
-    var config = _.defaults(options || {}, getConfig());
 
     // Create a local stream we can write the downloaded file to.
     var file = fs.createWriteStream(dest);
 
     // Pick out the configuration options we need for the client.
-    var client = knox.createClient(_(config).pick([
+    var client = knox.createClient(_(options).pick([
       'endpoint', 'port', 'key', 'secret', 'access', 'bucket'
     ]));
 
@@ -363,10 +426,9 @@ module.exports = function (grunt) {
    */
   grunt.registerHelper('s3.copy', function (src, dest, options) {
     var dfd = new _.Deferred();
-    var config = _.defaults(options || {}, getConfig());
 
     // Pick out the configuration options we need for the client.
-    var client = knox.createClient(_(config).pick([
+    var client = knox.createClient(_(options).pick([
       'endpoint', 'port', 'key', 'secret', 'access', 'bucket'
     ]));
 
@@ -398,10 +460,9 @@ module.exports = function (grunt) {
    */
   grunt.registerHelper('s3.delete', function (src, options) {
     var dfd = new _.Deferred();
-    var config = _.defaults(options || {}, getConfig());
 
     // Pick out the configuration options we need for the client.
-    var client = knox.createClient(_(config).pick([
+    var client = knox.createClient(_(options).pick([
       'endpoint', 'port', 'key', 'secret', 'access', 'bucket'
     ]));
 
