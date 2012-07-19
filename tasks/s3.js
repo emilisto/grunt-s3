@@ -78,6 +78,8 @@ module.exports = function (grunt) {
   function getConfig () {
     var dfd = _.Deferred();
 
+    // FIXME: skip reading from .s3cfg entirely
+
     var config = grunt.config.process('s3') || {};
 
     // Look for and process grunt template stings
@@ -294,8 +296,10 @@ module.exports = function (grunt) {
     }
 
     // If gzip is enabled, gzip the file into a temp file and then perform the
-    // upload.
-    if (options.gzip) {
+    // upload. The `gzip` option can be a function, that is passed the file path.
+
+    var gzip = _.isFunction(options.gzip) ?  options.gzip(src) : gzip;
+    if (gzip) {
       headers['Content-Encoding'] = 'gzip';
       headers['Content-Type'] = mime.lookup(src);
 
