@@ -245,7 +245,7 @@ module.exports = function (grunt) {
     }
 
     // var config = _.defaults(options || {}, getConfig());
-    var headers = options.headers || {};
+    var headers = _.defaults({}, options.headers);
 
     if (options.access) {
       headers['x-amz-acl'] = options.access;
